@@ -11,7 +11,6 @@ from urllib.parse import urljoin
 from PIL import Image
 import aiohttp
 from bs4 import BeautifulSoup
-from fake_useragent import UserAgent
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -31,16 +30,18 @@ TAMANO_IMAGEN_PX = 500
 BUCKET_NAME = "imagenes_scraper"
 MAX_RETRIES = 3
 
-# Namespaces para leer el sitemap correctamente (Basado en tu código original)
-NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-
-ua = UserAgent()
+# Lista fija de User-Agents confiables (fake_useragent a veces genera UAs de bots)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0"
+]
 
 def obtener_headers_dinamicos():
     return {
-        "User-Agent": ua.random,
+        "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": random.choice(["es-AR,es;q=0.9", "es-ES,es;q=0.8,en;q=0.7", "en-US,en;q=0.5"]),
+        "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://www.google.com/",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1"
@@ -54,6 +55,10 @@ def limpiar_precio(precio_str):
         return float(limpio)
     except ValueError:
         return None
+
+# Helper para ejecutar llamadas de Supabase sin bloquear el event loop asíncrono
+async def db_execute(query):
+    return await asyncio.to_thread(query.execute)
 
 async def procesar_imagen(session, url_img, ean):
     """Descarga, redimensiona y sube a Supabase Storage en memoria."""
@@ -78,10 +83,13 @@ async def procesar_imagen(session, url_img, ean):
                 
                 file_path = f"{ean}.jpg"
                 
-                supabase.storage.from_(BUCKET_NAME).upload(
-                    file=output.read(), 
-                    path=file_path, 
-                    file_options={"content-type": "image/jpeg", "upsert": "true"}
+                # Subida sincrónica enviada al threadpool
+                await asyncio.to_thread(
+                    lambda: supabase.storage.from_(BUCKET_NAME).upload(
+                        file=output.read(), 
+                        path=file_path, 
+                        file_options={"content-type": "image/jpeg", "upsert": "true"}
+                    )
                 )
                 return supabase.storage.from_(BUCKET_NAME).get_public_url(file_path)
     except Exception as e:
@@ -137,7 +145,7 @@ async def extraer_datos_producto(session, url):
                         "imagen_url_original": imagen_url_original
                     }
                 elif r.status in [403, 429]:
-                    print(f"🛑 Bloqueo detectado ({r.status}). Pausando 30s...")
+                    print(f"🛑 Bloqueo detectado al producto ({r.status}). Pausando 30s...")
                     await asyncio.sleep(30)
         except Exception as e:
             await asyncio.sleep(5)
@@ -154,7 +162,7 @@ async def guardar_en_db(datos, url_imagen_storage):
             "imagen_url": url_imagen_storage,
             "ultima_actualizacion": datetime.now().isoformat()
         }
-        res_prod = supabase.table("productos_laanonima").upsert(producto_data, on_conflict="ean").execute()
+        res_prod = await db_execute(supabase.table("productos_laanonima").upsert(producto_data, on_conflict="ean"))
         
         if res_prod.data:
             producto_id = res_prod.data[0]['id']
@@ -163,7 +171,7 @@ async def guardar_en_db(datos, url_imagen_storage):
                 "precio": datos["precio_actual"],
                 "precio_anterior": datos["precio_anterior"]
             }
-            supabase.table("precios_historial").insert(historial_data).execute()
+            await db_execute(supabase.table("precios_historial").insert(historial_data))
             print(f"✅ Guardado: {datos['nombre'][:30]}... | EAN: {datos['ean']} | ${datos['precio_actual']}")
             
     except Exception as e:
@@ -171,36 +179,43 @@ async def guardar_en_db(datos, url_imagen_storage):
 
 async def procesar_url_pendiente(session, row):
     url = row['url']
-    print(f"🔍 Evaluando: {url}")
+    print(f"\n🔍 Evaluando: {url}")
     
-    supabase.table("sitemap_urls").update({"ultimo_intento": datetime.now().isoformat()}).eq("id", row['id']).execute()
+    await db_execute(supabase.table("sitemap_urls").update({"ultimo_intento": datetime.now().isoformat()}).eq("id", row['id']))
     
     try:
         if ".xml" in url:
-            # ES UN SITEMAP: Lógica original de tu archivo 1-extrae urls.py
+            # ES UN SITEMAP
             async with session.get(url, headers=obtener_headers_dinamicos(), timeout=30) as r:
+                print(f"📡 Estado HTTP Sitemap: {r.status}")
+                xml_text = await r.text()
+                
+                # Logs requeridos para depuración
+                print(f"📄 Primeros 400 caracteres de la respuesta:\n{xml_text[:400]}")
+                
                 if r.status == 200:
-                    xml_text = await r.text()
-                    root = ET.fromstring(xml_text)
+                    # Limpiamos namespaces (xmlns) del XML para un parseo a prueba de fallos
+                    xml_clean = re.sub(r'\sxmlns="[^"]+"', '', xml_text, count=1)
+                    root = ET.fromstring(xml_clean)
                     
-                    urls_encontradas = []
-                    # Maneja tanto sitemapindex como urlset
-                    for elemento in root.findall(".//sm:loc", NS):
-                        loc = elemento.text.strip() if elemento.text else ""
-                        if loc:
-                            urls_encontradas.append(loc)
+                    # Busca locs sin importar el namespace
+                    urls_encontradas = [elem.text.strip() for elem in root.findall(".//loc") if elem.text]
                     
                     if urls_encontradas:
-                        print(f"📦 ¡Jackpot! {len(urls_encontradas)} URLs encontradas en el XML. Mandando a la cola...")
+                        print(f"📦 ¡Jackpot! {len(urls_encontradas)} URLs encontradas. Mandando a la cola...")
                         for i in range(0, len(urls_encontradas), 100):
                             lote = [{"url": u, "procesado": False} for u in urls_encontradas[i:i+100]]
-                            supabase.table("sitemap_urls").upsert(lote, on_conflict="url", ignore_duplicates=True).execute()
+                            await db_execute(supabase.table("sitemap_urls").upsert(lote, on_conflict="url", ignore_duplicates=True))
+                    else:
+                        print("⚠️ No se encontraron etiquetas <loc> en el XML.")
+                else:
+                    print(f"❌ Error al obtener el sitemap. Es posible que el servidor esté bloqueando la petición.")
 
         elif "/art_" in url:
             # ES UN PRODUCTO
             datos = await extraer_datos_producto(session, url)
             if datos:
-                prod_existente = supabase.table("productos_laanonima").select("imagen, imagen_url").eq("ean", datos["ean"]).execute()
+                prod_existente = await db_execute(supabase.table("productos_laanonima").select("imagen, imagen_url").eq("ean", datos["ean"]))
                 url_img_storage = None
                 
                 if prod_existente.data and prod_existente.data[0].get("imagen"):
@@ -226,7 +241,7 @@ async def procesar_url_pendiente(session, row):
                         print(f"🛒 Encontrados {len(urls_productos)} productos en categoría. Mandando a cola...")
                         for i in range(0, len(urls_productos), 100):
                             lote = [{"url": u, "procesado": False} for u in urls_productos[i:i+100]]
-                            supabase.table("sitemap_urls").upsert(lote, on_conflict="url", ignore_duplicates=True).execute()
+                            await db_execute(supabase.table("sitemap_urls").upsert(lote, on_conflict="url", ignore_duplicates=True))
                     
                     a_next = soup.find("a", rel=lambda v: v and "next" in v.lower() if isinstance(v, str) else False)
                     if not a_next:
@@ -237,29 +252,30 @@ async def procesar_url_pendiente(session, row):
                                 
                     if a_next and a_next.get("href"):
                         next_url = urljoin(url, a_next["href"])
-                        supabase.table("sitemap_urls").upsert([{"url": next_url, "procesado": False}], on_conflict="url", ignore_duplicates=True).execute()
+                        await db_execute(supabase.table("sitemap_urls").upsert([{"url": next_url, "procesado": False}], on_conflict="url", ignore_duplicates=True))
+                else:
+                    print(f"⚠️ Error {r.status} al acceder a categoría {url}")
 
         # Marcar URL como completada tras procesarla con éxito
-        supabase.table("sitemap_urls").update({"procesado": True}).eq("id", row['id']).execute()
+        await db_execute(supabase.table("sitemap_urls").update({"procesado": True}).eq("id", row['id']))
         
     except Exception as e:
         print(f"❌ Error procesando {url}: {e}")
 
-def asegurar_arranque_automatico():
-    """Verifica si la cola está vacía. Si lo está, inyecta el sitemap original para dar arranque."""
-    pendientes = supabase.table("sitemap_urls").select("id").eq("procesado", False).limit(1).execute()
+async def asegurar_arranque_automatico():
+    """Verifica si la cola está vacía. Si lo está, inyecta el sitemap original."""
+    pendientes = await db_execute(supabase.table("sitemap_urls").select("id").eq("procesado", False).limit(1))
     if not pendientes.data:
         print("⚙️ La cola está vacía. Inyectando Sitemap original para reiniciar el ciclo...")
-        supabase.table("sitemap_urls").upsert(
+        await db_execute(supabase.table("sitemap_urls").upsert(
             {"url": "https://www.laanonima.com.ar/sitemap-listados.xml", "procesado": False}, 
             on_conflict="url"
-        ).execute()
+        ))
 
 async def orquestador():
     print("🚀 Iniciando Scraper con Protección Anti-Ban y Carrera de Relevos...")
     
-    # Validar que haya datos antes de arrancar el loop
-    asegurar_arranque_automatico()
+    await asegurar_arranque_automatico()
     
     connector = aiohttp.TCPConnector(limit_per_host=CONCURRENCIA_MAXIMA)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -268,13 +284,13 @@ async def orquestador():
                 print("\n⏰ Límite de 5.5 horas alcanzado. Cerrando limpiamente para pasar el relevo...")
                 break
                 
-            pendientes = supabase.table("sitemap_urls").select("*").eq("procesado", False).order("id").limit(5).execute()
+            res = await db_execute(supabase.table("sitemap_urls").select("*").eq("procesado", False).order("id").limit(5))
             
-            if not pendientes.data:
+            if not res.data:
                 print("🏁 No hay más URLs pendientes. Proceso completo.")
                 break
                 
-            tareas = [procesar_url_pendiente(session, row) for row in pendientes.data]
+            tareas = [procesar_url_pendiente(session, row) for row in res.data]
             await asyncio.gather(*tareas)
 
 if __name__ == "__main__":
