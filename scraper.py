@@ -4,7 +4,9 @@ import time
 import io
 import re
 import random
+import json
 from datetime import datetime
+from urllib.parse import urljoin
 from PIL import Image
 import aiohttp
 from bs4 import BeautifulSoup
@@ -15,15 +17,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==========================================
-# CONFIGURACIÓN Y LIMITES
+# CONFIGURACIÓN Y LÍMITES
 # ==========================================
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 TIEMPO_INICIO = time.time()
-LIMITE_TIEMPO_SEGUNDOS = (5.5 * 3600)  # 5.5 horas de límite para GitHub Actions
-CONCURRENCIA_MAXIMA = 2  # Bajo para no saturar y evitar bans
+LIMITE_TIEMPO_SEGUNDOS = (5.5 * 3600)  # 5.5 horas de límite
+CONCURRENCIA_MAXIMA = 2  
 TAMANO_IMAGEN_PX = 500
 BUCKET_NAME = "imagenes_scraper"
 MAX_RETRIES = 3
@@ -72,58 +74,75 @@ async def procesar_imagen(session, url_img, ean):
                 
                 file_path = f"{ean}.jpg"
                 
-                # Subir a Supabase Storage
                 supabase.storage.from_(BUCKET_NAME).upload(
                     file=output.read(), 
                     path=file_path, 
                     file_options={"content-type": "image/jpeg", "upsert": "true"}
                 )
-                
                 return supabase.storage.from_(BUCKET_NAME).get_public_url(file_path)
     except Exception as e:
-        print(f"⚠️ Error con imagen EAN {ean}: {e}")
+        print(f"⚠️ Error procesando imagen EAN {ean}: {e}")
     return None
 
 async def extraer_datos_producto(session, url):
-    """Extrae datos base del HTML del producto."""
+    """Extrae datos base y URL de imagen del HTML del producto."""
     for intento in range(MAX_RETRIES):
         try:
-            await asyncio.sleep(random.uniform(2.0, 5.0)) # Jitter anti-ban
+            await asyncio.sleep(random.uniform(2.0, 4.0)) 
             async with session.get(url, headers=obtener_headers_dinamicos(), timeout=20) as r:
                 if r.status == 200:
                     html = await r.text()
                     soup = BeautifulSoup(html, "html.parser")
                     
-                    # Logica basica de extracción (Adaptada a la estructura de La Anonima)
                     nombre = soup.find("h1").get_text(strip=True) if soup.find("h1") else None
                     precio_tag = soup.find(class_=re.compile("precio", re.I))
                     precio = precio_tag.get_text(strip=True) if precio_tag else None
                     
-                    ean_script = soup.find("script", attrs={"data-flix-ean": True})
-                    ean = ean_script.get("data-flix-ean") if ean_script else None
+                    ean = None
+                    script_flix = soup.find("script", attrs={"data-flix-ean": True})
+                    if script_flix:
+                        ean = (script_flix.get("data-flix-ean") or "").strip() or None
                     
-                    if not ean: # Si no hay EAN, es inútil para inventario
+                    if not ean: 
                         return None
                         
+                    # Lógica para extraer la imagen original (Basado en tu código original)
+                    imagen_url_original = None
+                    for script in soup.find_all("script", type="application/ld+json"):
+                        try:
+                            txt = script.string or script.get_text(strip=True)
+                            if not txt: continue
+                            data = json.loads(txt)
+                            objetos = data if isinstance(data, list) else [data]
+                            for obj in objetos:
+                                 if isinstance(obj, dict) and obj.get("@type") == "Product" and obj.get("image"):
+                                     img_data = obj.get("image")
+                                     imagen_url_original = img_data if isinstance(img_data, str) else (img_data[0] if isinstance(img_data, list) and img_data else None)
+                                     break
+                        except Exception: continue
+                            
+                    if not imagen_url_original:
+                        a_foto = soup.find("a", attrs={"data-fancybox": "fotos"})
+                        if a_foto and a_foto.get("href"): imagen_url_original = a_foto["href"]
+                    
                     return {
                         "ean": ean,
                         "nombre": nombre,
                         "url_producto": url,
                         "precio_actual": limpiar_precio(precio),
-                        "precio_anterior": None # Ajustar si extraen el tachado
+                        "precio_anterior": None,
+                        "imagen_url_original": imagen_url_original
                     }
                 elif r.status in [403, 429]:
                     print(f"🛑 Bloqueo detectado ({r.status}). Pausando 30s...")
                     await asyncio.sleep(30)
         except Exception as e:
-            print(f"Error en {url}: {e}")
             await asyncio.sleep(5)
     return None
 
 async def guardar_en_db(datos, url_imagen_storage):
     """Guarda o actualiza producto y añade registro al historial de precios."""
     try:
-        # Upsert Producto
         producto_data = {
             "ean": datos["ean"],
             "nombre": datos["nombre"],
@@ -136,52 +155,89 @@ async def guardar_en_db(datos, url_imagen_storage):
         
         if res_prod.data:
             producto_id = res_prod.data[0]['id']
-            
-            # Insertar en Historial de Precios
             historial_data = {
                 "producto_id": producto_id,
                 "precio": datos["precio_actual"],
                 "precio_anterior": datos["precio_anterior"]
             }
             supabase.table("precios_historial").insert(historial_data).execute()
-            print(f"✅ Guardado: {datos['nombre']} | EAN: {datos['ean']} | ${datos['precio_actual']}")
+            print(f"✅ Guardado: {datos['nombre'][:30]}... | EAN: {datos['ean']} | ${datos['precio_actual']}")
             
     except Exception as e:
         print(f"❌ Error guardando en BD EAN {datos['ean']}: {e}")
 
 async def procesar_url_pendiente(session, row):
     url = row['url']
-    print(f"🔍 Procesando: {url}")
+    print(f"🔍 Evaluando: {url}")
     
-    # Marcamos inicio de intento
+    # Registramos que estamos intentando leer esta URL
     supabase.table("sitemap_urls").update({"ultimo_intento": datetime.now().isoformat()}).eq("id", row['id']).execute()
     
-    # Lógica de enrutamiento (Si es sitemap extrae URLs, si es producto extrae datos)
-    if "sitemap" in url or ".xml" in url:
-        # Aquí va la lógica de parsear sitemap y subir URLs nuevas a sitemap_urls con procesado=false
-        # supabase.table("sitemap_urls").insert({"url": nueva_url}).execute()
-        pass 
-    elif "art_" in url:
-        datos = await extraer_datos_producto(session, url)
-        if datos:
-            # Comprobar si ya tenemos imagen
-            prod_existente = supabase.table("productos_laanonima").select("imagen, imagen_url").eq("ean", datos["ean"]).execute()
-            url_img_storage = None
-            
-            if prod_existente.data and prod_existente.data[0].get("imagen"):
-                url_img_storage = prod_existente.data[0].get("imagen_url")
-                print(f"⏭️ Imagen existente para EAN {datos['ean']}. Saltando descarga.")
-            else:
-                # Extraer URL de imagen original desde HTML y descargarla
-                # (Asumiendo que 'datos' trajo 'url_imagen_original')
-                url_imagen_original = "..." # Aquí va el selector de imagen de BS4
-                if url_imagen_original:
-                    url_img_storage = await procesar_imagen(session, url_imagen_original, datos["ean"])
+    try:
+        if ".xml" in url:
+            # ES UN SITEMAP: Extraer todas las URLs hijas usando regex puro (evita errores de namespaces XML)
+            async with session.get(url, headers=obtener_headers_dinamicos(), timeout=30) as r:
+                if r.status == 200:
+                    xml_text = await r.text()
+                    urls_encontradas = re.findall(r'<loc>(.*?)</loc>', xml_text)
+                    
+                    if urls_encontradas:
+                        print(f"📦 ¡Jackpot! {len(urls_encontradas)} URLs encontradas en sitemap. Mandando a la cola...")
+                        for i in range(0, len(urls_encontradas), 100):
+                            lote = [{"url": u, "procesado": False} for u in urls_encontradas[i:i+100]]
+                            supabase.table("sitemap_urls").upsert(lote, on_conflict="url", ignore_duplicates=True).execute()
 
-            await guardar_en_db(datos, url_img_storage)
-    
-    # Marcamos como completado
-    supabase.table("sitemap_urls").update({"procesado": True}).eq("id", row['id']).execute()
+        elif "/art_" in url:
+            # ES UN PRODUCTO: Extraer EAN, Datos e Imagen
+            datos = await extraer_datos_producto(session, url)
+            if datos:
+                prod_existente = supabase.table("productos_laanonima").select("imagen, imagen_url").eq("ean", datos["ean"]).execute()
+                url_img_storage = None
+                
+                if prod_existente.data and prod_existente.data[0].get("imagen"):
+                    url_img_storage = prod_existente.data[0].get("imagen_url")
+                    print(f"⏭️ Imagen ya existe en Supabase para EAN {datos['ean']}.")
+                else:
+                    if datos.get("imagen_url_original"):
+                        url_img_storage = await procesar_imagen(session, datos["imagen_url_original"], datos["ean"])
+
+                await guardar_en_db(datos, url_img_storage)
+
+        else:
+            # ES UNA CATEGORÍA: Extraer productos listados y buscar la siguiente página
+            async with session.get(url, headers=obtener_headers_dinamicos(), timeout=30) as r:
+                if r.status == 200:
+                    html = await r.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    
+                    # 1. Extraer los productos de esta página
+                    productos = soup.select('a[data-codigo][href*="/art_"]')
+                    urls_productos = [urljoin(url, a.get("href", "").strip()) for a in productos if a.get("href")]
+                    
+                    if urls_productos:
+                        print(f"🛒 Encontrados {len(urls_productos)} productos en categoría. Mandando a cola...")
+                        for i in range(0, len(urls_productos), 100):
+                            lote = [{"url": u, "procesado": False} for u in urls_productos[i:i+100]]
+                            supabase.table("sitemap_urls").upsert(lote, on_conflict="url", ignore_duplicates=True).execute()
+                    
+                    # 2. Buscar si hay una página "Siguiente"
+                    a_next = soup.find("a", rel=lambda v: v and "next" in v.lower() if isinstance(v, str) else False)
+                    if not a_next:
+                        for a in soup.find_all("a", href=True):
+                            if " ".join(a.get_text(" ", strip=True).split()).lower() in {"siguiente", "next", ">", "»"}:
+                                a_next = a
+                                break
+                                
+                    if a_next and a_next.get("href"):
+                        next_url = urljoin(url, a_next["href"])
+                        supabase.table("sitemap_urls").upsert([{"url": next_url, "procesado": False}], on_conflict="url", ignore_duplicates=True).execute()
+
+        # Si el proceso llegó hasta acá sin crashear, marcamos la URL como completada.
+        supabase.table("sitemap_urls").update({"procesado": True}).eq("id", row['id']).execute()
+        
+    except Exception as e:
+        print(f"❌ Error procesando {url}: {e}")
+
 
 async def orquestador():
     print("🚀 Iniciando Scraper con Protección Anti-Ban y Carrera de Relevos...")
@@ -189,12 +245,10 @@ async def orquestador():
     
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
-            # Verificar Tiempo Límite GitHub Actions
             if time.time() - TIEMPO_INICIO > LIMITE_TIEMPO_SEGUNDOS:
                 print("\n⏰ Límite de 5.5 horas alcanzado. Cerrando limpiamente para pasar el relevo...")
                 break
                 
-            # Buscar siguientes 5 URLs no procesadas
             pendientes = supabase.table("sitemap_urls").select("*").eq("procesado", False).order("id").limit(5).execute()
             
             if not pendientes.data:
