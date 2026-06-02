@@ -1,0 +1,34 @@
+name: Robot Scraper LunaTec Carrera de Relevos
+
+on:
+  schedule:
+    # Corre cada 8 horas (Asegura no solaparse y esquiva el limite de 6h)
+    - cron: '0 */8 * * *'
+  workflow_dispatch:
+
+jobs:
+  ejecutar-scraper:
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: scraper-unico
+      cancel-in-progress: false
+
+    steps:
+      - name: 📥 Clonar el código
+        uses: actions/checkout@v4
+
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 📦 Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: 🚀 Ejecutar Scraper Asíncrono
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scraper.py
