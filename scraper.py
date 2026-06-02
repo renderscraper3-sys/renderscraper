@@ -129,7 +129,9 @@ def extraer_datos_producto(session, url):
             marca = None
             cat1, cat2, cat3 = None, None, None
             
-            # Lógica para extraer Marca y Categorías del JSON oculto
+            # ==============================================================
+            # COMIENZO DEL BLOQUE MODIFICADO: EXTRACCIÓN ROBUSTA DE CATEGORÍAS
+            # ==============================================================
             for script in soup.find_all("script", type="application/ld+json"):
                 try:
                     txt = script.string or script.get_text(strip=True)
@@ -151,16 +153,63 @@ def extraer_datos_producto(session, url):
 
                         if obj.get("@type") == "BreadcrumbList":
                             items = obj.get("itemListElement", [])
-                            items_sorted = sorted([i for i in items if isinstance(i, dict)], key=lambda x: x.get("position", 99))
-                            nombres = [i.get("name").strip() for i in items_sorted if i.get("name") and i.get("name").strip().lower() not in ["inicio", "home"]]
+                            items_sorted = sorted([i for i in items if isinstance(i, dict)], key=lambda x: int(x.get("position", 99)))
                             
-                            if len(nombres) > 0: cat1 = nombres[0]
-                            if len(nombres) > 1: cat2 = nombres[1]
-                            if len(nombres) > 2: cat3 = nombres[2]
+                            nombres = []
+                            for item in items_sorted:
+                                # CORRECCIÓN: La Anónima pone el nombre anidado dentro del diccionario 'item'
+                                name = item.get("name")
+                                if not name and isinstance(item.get("item"), dict):
+                                    name = item.get("item").get("name")
+                                
+                                if name and isinstance(name, str):
+                                    name = name.strip()
+                                    if name.lower() not in ["inicio", "home", "la anonima"] and name not in nombres:
+                                        nombres.append(name)
+                            
+                            if len(nombres) > 0 and not cat1: cat1 = nombres[0]
+                            if len(nombres) > 1 and not cat2: cat2 = nombres[1]
+                            if len(nombres) > 2 and not cat3: cat3 = nombres[2]
                                 
                 except Exception: 
                     continue
-                    
+
+            # ESCUDO 1: Buscar las categorías en las migas de pan del HTML si el JSON falla
+            if not cat1:
+                breadcrumb = soup.find(class_=re.compile(r"breadcrumb|migas|ruta", re.I)) or soup.find("ul", class_=re.compile(r"breadcrumb", re.I))
+                if breadcrumb:
+                    enlaces = breadcrumb.find_all("a")
+                    nombres = []
+                    for a in enlaces:
+                        texto = a.get_text(strip=True)
+                        if texto and texto.lower() not in ["inicio", "home", "la anonima"] and texto not in nombres:
+                            nombres.append(texto)
+                    if len(nombres) > 0: cat1 = nombres[0]
+                    if len(nombres) > 1: cat2 = nombres[1]
+                    if len(nombres) > 2: cat3 = nombres[2]
+
+            # ESCUDO 2: Buscar en los links del menú basados en el patrón de URL (/n1_, /n2_, /n3_)
+            if not cat1:
+                enlaces_cat = soup.select('a[href*="/n1_"], a[href*="/n2_"], a[href*="/n3_"]')
+                rutas = {}
+                for a in enlaces_cat:
+                    texto = a.get_text(strip=True)
+                    href = a.get("href", "")
+                    if texto and texto.lower() not in ["inicio", "home", "la anonima"]:
+                        m = re.search(r"/n(\d+)_", href)
+                        if m:
+                            nivel = int(m.group(1))
+                            if nivel not in rutas:
+                                rutas[nivel] = texto
+                
+                nombres = [rutas[k] for k in sorted(rutas.keys())]
+                if len(nombres) > 0: cat1 = nombres[0]
+                if len(nombres) > 1: cat2 = nombres[1]
+                if len(nombres) > 2: cat3 = nombres[2]
+            # ==============================================================
+            # FIN DEL BLOQUE MODIFICADO
+            # ==============================================================
+            
             if not imagen_url_original:
                 a_foto = soup.find("a", attrs={"data-fancybox": "fotos"})
                 if a_foto and a_foto.get("href"): imagen_url_original = a_foto["href"]
