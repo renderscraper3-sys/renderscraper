@@ -1,0 +1,6 @@
+aiohttp
+beautifulsoup4
+Pillow
+fake-useragent
+supabase
+python-dotenv
