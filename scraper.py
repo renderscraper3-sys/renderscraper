@@ -5,6 +5,7 @@ import io
 import re
 import random
 import json
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from urllib.parse import urljoin
 from PIL import Image
@@ -24,11 +25,14 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 TIEMPO_INICIO = time.time()
-LIMITE_TIEMPO_SEGUNDOS = (5.5 * 3600)  # 5.5 horas de límite
+LIMITE_TIEMPO_SEGUNDOS = (5.5 * 3600)  # 5.5 horas de límite para Github
 CONCURRENCIA_MAXIMA = 2  
 TAMANO_IMAGEN_PX = 500
 BUCKET_NAME = "imagenes_scraper"
 MAX_RETRIES = 3
+
+# Namespaces para leer el sitemap correctamente (Basado en tu código original)
+NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 ua = UserAgent()
 
@@ -106,7 +110,6 @@ async def extraer_datos_producto(session, url):
                     if not ean: 
                         return None
                         
-                    # Lógica para extraer la imagen original (Basado en tu código original)
                     imagen_url_original = None
                     for script in soup.find_all("script", type="application/ld+json"):
                         try:
@@ -170,25 +173,31 @@ async def procesar_url_pendiente(session, row):
     url = row['url']
     print(f"🔍 Evaluando: {url}")
     
-    # Registramos que estamos intentando leer esta URL
     supabase.table("sitemap_urls").update({"ultimo_intento": datetime.now().isoformat()}).eq("id", row['id']).execute()
     
     try:
         if ".xml" in url:
-            # ES UN SITEMAP: Extraer todas las URLs hijas usando regex puro (evita errores de namespaces XML)
+            # ES UN SITEMAP: Lógica original de tu archivo 1-extrae urls.py
             async with session.get(url, headers=obtener_headers_dinamicos(), timeout=30) as r:
                 if r.status == 200:
                     xml_text = await r.text()
-                    urls_encontradas = re.findall(r'<loc>(.*?)</loc>', xml_text)
+                    root = ET.fromstring(xml_text)
+                    
+                    urls_encontradas = []
+                    # Maneja tanto sitemapindex como urlset
+                    for elemento in root.findall(".//sm:loc", NS):
+                        loc = elemento.text.strip() if elemento.text else ""
+                        if loc:
+                            urls_encontradas.append(loc)
                     
                     if urls_encontradas:
-                        print(f"📦 ¡Jackpot! {len(urls_encontradas)} URLs encontradas en sitemap. Mandando a la cola...")
+                        print(f"📦 ¡Jackpot! {len(urls_encontradas)} URLs encontradas en el XML. Mandando a la cola...")
                         for i in range(0, len(urls_encontradas), 100):
                             lote = [{"url": u, "procesado": False} for u in urls_encontradas[i:i+100]]
                             supabase.table("sitemap_urls").upsert(lote, on_conflict="url", ignore_duplicates=True).execute()
 
         elif "/art_" in url:
-            # ES UN PRODUCTO: Extraer EAN, Datos e Imagen
+            # ES UN PRODUCTO
             datos = await extraer_datos_producto(session, url)
             if datos:
                 prod_existente = supabase.table("productos_laanonima").select("imagen, imagen_url").eq("ean", datos["ean"]).execute()
@@ -204,13 +213,12 @@ async def procesar_url_pendiente(session, row):
                 await guardar_en_db(datos, url_img_storage)
 
         else:
-            # ES UNA CATEGORÍA: Extraer productos listados y buscar la siguiente página
+            # ES UNA CATEGORÍA
             async with session.get(url, headers=obtener_headers_dinamicos(), timeout=30) as r:
                 if r.status == 200:
                     html = await r.text()
                     soup = BeautifulSoup(html, "html.parser")
                     
-                    # 1. Extraer los productos de esta página
                     productos = soup.select('a[data-codigo][href*="/art_"]')
                     urls_productos = [urljoin(url, a.get("href", "").strip()) for a in productos if a.get("href")]
                     
@@ -220,7 +228,6 @@ async def procesar_url_pendiente(session, row):
                             lote = [{"url": u, "procesado": False} for u in urls_productos[i:i+100]]
                             supabase.table("sitemap_urls").upsert(lote, on_conflict="url", ignore_duplicates=True).execute()
                     
-                    # 2. Buscar si hay una página "Siguiente"
                     a_next = soup.find("a", rel=lambda v: v and "next" in v.lower() if isinstance(v, str) else False)
                     if not a_next:
                         for a in soup.find_all("a", href=True):
@@ -232,17 +239,29 @@ async def procesar_url_pendiente(session, row):
                         next_url = urljoin(url, a_next["href"])
                         supabase.table("sitemap_urls").upsert([{"url": next_url, "procesado": False}], on_conflict="url", ignore_duplicates=True).execute()
 
-        # Si el proceso llegó hasta acá sin crashear, marcamos la URL como completada.
+        # Marcar URL como completada tras procesarla con éxito
         supabase.table("sitemap_urls").update({"procesado": True}).eq("id", row['id']).execute()
         
     except Exception as e:
         print(f"❌ Error procesando {url}: {e}")
 
+def asegurar_arranque_automatico():
+    """Verifica si la cola está vacía. Si lo está, inyecta el sitemap original para dar arranque."""
+    pendientes = supabase.table("sitemap_urls").select("id").eq("procesado", False).limit(1).execute()
+    if not pendientes.data:
+        print("⚙️ La cola está vacía. Inyectando Sitemap original para reiniciar el ciclo...")
+        supabase.table("sitemap_urls").upsert(
+            {"url": "https://www.laanonima.com.ar/sitemap-listados.xml", "procesado": False}, 
+            on_conflict="url"
+        ).execute()
 
 async def orquestador():
     print("🚀 Iniciando Scraper con Protección Anti-Ban y Carrera de Relevos...")
-    connector = aiohttp.TCPConnector(limit_per_host=CONCURRENCIA_MAXIMA)
     
+    # Validar que haya datos antes de arrancar el loop
+    asegurar_arranque_automatico()
+    
+    connector = aiohttp.TCPConnector(limit_per_host=CONCURRENCIA_MAXIMA)
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             if time.time() - TIEMPO_INICIO > LIMITE_TIEMPO_SEGUNDOS:
