@@ -31,18 +31,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0"
 ]
 
-# URLS DE PRUEBA PROPORCIONADAS
-TEST_URLS = [
-    "https://www.laanonima.com.ar/tv-y-video/n1_3/",
-    "https://www.laanonima.com.ar/smart-tv/n2_58/",
-    "https://www.laanonima.com.ar/accesorios/n2_61/",
-    "https://www.laanonima.com.ar/soportes-para-tv/n3_63/",
-    "https://www.laanonima.com.ar/antenas/n3_64/",
-    "https://www.laanonima.com.ar/controles-remoto/n3_65/",
-    "https://www.laanonima.com.ar/lentes-tv/n3_90/",
-    "https://www.laanonima.com.ar/cables/n3_66/"
-]
-
 def obtener_headers_dinamicos():
     return {
         "User-Agent": random.choice(USER_AGENTS),
@@ -227,11 +215,38 @@ async def test_flujo_completo(session, url_categoria):
     except Exception as e:
         print(f"❌ Error de red conectando con la categoría: {e}")
 
+# ==========================================
+# NUEVA LÓGICA DE RECUPERACIÓN DE URLs
+# ==========================================
+async def obtener_urls_desde_supabase():
+    print("📡 Obteniendo URLs desde la tabla 'sitemap_urls' en Supabase...")
+    try:
+        respuesta = await db_execute(supabase.table("sitemap_urls").select("url"))
+        if respuesta.data:
+            urls = [fila["url"] for fila in respuesta.data if "url" in fila]
+            print(f"✅ Se obtuvieron {len(urls)} URLs correctamente.")
+            return urls
+        else:
+            print("⚠️ La tabla sitemap_urls devolvió una respuesta vacía.")
+            return []
+    except Exception as e:
+        print(f"❌ Error al consultar URLs en Supabase: {e}")
+        return []
+
 async def orquestador_test():
     print("🚀 Iniciando Script de Testeo de Direcciones de La Anónima...")
+    
+    # 1. Cargamos las URLs dinámicamente
+    test_urls = await obtener_urls_desde_supabase()
+    
+    if not test_urls:
+        print("🛑 No hay URLs para procesar. Abortando ejecución.")
+        return
+
+    # 2. Procedemos con la ejecución normal
     connector = aiohttp.TCPConnector(limit_per_host=1)
     async with aiohttp.ClientSession(connector=connector) as session:
-        for url in TEST_URLS:
+        for url in test_urls:
             await test_flujo_completo(session, url)
             # Pequeña pausa entre URL y URL
             await asyncio.sleep(random.uniform(3.0, 6.0))
